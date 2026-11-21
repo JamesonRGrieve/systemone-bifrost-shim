@@ -1,0 +1,8 @@
+# Binaries
+/systemone-bifrost-shim
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
