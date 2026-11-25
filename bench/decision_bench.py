@@ -255,6 +255,207 @@ def cmd_sweep(args):
                 time.sleep(3)
 
 
+def _png(w=448, h=448):
+    """A small RGB gradient PNG (stdlib), as a data URL for vision decision models."""
+    import base64, struct, zlib
+    raw = b"".join(b"\x00" + b"".join(bytes((x * 255 // w, y * 255 // h, 128)) for x in range(w))
+                   for y in range(h))
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+TEST_IMAGE = _png()
+
+BUF_RE = None
+
+
+def parse_buffers(path):
+    """Sum llama.cpp's '<dev> <kind> buffer size = N MiB' lines by kind."""
+    import re
+    global BUF_RE
+    BUF_RE = BUF_RE or re.compile(r"(\S+)\s+(model|KV|RS|compute|output)\s+buffer size\s*=\s*([\d.]+)\s*MiB")
+    out = {}
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                m = BUF_RE.search(line)
+                if m and not m.group(1).startswith("CPU"):
+                    k = m.group(2)
+                    out[k] = round(out.get(k, 0) + float(m.group(3)), 2)
+    except OSError:
+        pass
+    return out
+
+
+class Fitter:
+    """Measures one model's device memory at (slots, per-slot context) points."""
+
+    def __init__(self, args):
+        self.args, self.cache = args, {}
+        self.base = gpu_used_mib(args.gpu)
+        self.url = f"http://127.0.0.1:{args.port}"
+        self.logpath = (args.out or "fit") + ".server.log"
+
+    def measure(self, np_, ctx):
+        key = (np_, ctx)
+        if key in self.cache:
+            return self.cache[key]
+        a = self.args
+        total = np_ * ctx if not a.unified else ctx
+        cmd = [a.server, "-m", a.model, "--host", "127.0.0.1", "--port", str(a.port),
+               "-ngl", "99", "-c", str(total), "-np", str(np_),
+               "-b", str(min(total, a.batch)), "-ub", str(min(total, a.batch))]
+        if a.mmproj:
+            cmd += ["--mmproj", a.mmproj]
+        if a.device:
+            cmd += ["--device", a.device]
+        if a.unified:
+            cmd += ["--kv-unified"]
+        cmd += a.extra.split() if a.extra else []
+        with open(self.logpath, "w") as lf:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+
+        def kill(p=proc):
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        guard = Guard(a, on_trip=kill)
+        guard.start()
+        lanes = None
+        try:
+            ok = wait_health(self.url, proc, timeout=a.load_timeout)
+            time.sleep(1.5)
+            used = gpu_used_mib(a.gpu) if ok else None
+            if ok and not guard.tripped:
+                lanes = self.fill_lanes(np_, ctx, guard)
+        finally:
+            guard.stop()
+            kill()
+            proc.wait()
+        bufs = parse_buffers(self.logpath)
+        dev_sum = round(sum(bufs.values()), 1) if bufs else None
+        row = {"mode": "fit", "model": os.path.basename(a.model), "mmproj": bool(a.mmproj),
+               "device": a.device, "np": np_, "ctx_per_slot": ctx, "ctx_total": total,
+               "unified": a.unified, "loaded": ok, "guard": guard.tripped,
+               "buffers_mib": bufs, "buffers_sum_mib": dev_sum,
+               "gpu_used_delta_mib": (used - self.base) if ok and None not in (used, self.base) else None,
+               "lanes": lanes,
+               "peak_vram_mib": guard.peak_vram,
+               "peak_delta_mib": (guard.peak_vram - self.base) if self.base is not None else None,
+               "min_host_avail_mib": guard.min_host}
+        emit(a, row)
+        log(f"np={np_} ctx={ctx}: loaded={ok} idle={row['gpu_used_delta_mib']} "
+            f"peak={row['peak_delta_mib']} lanes={lanes and lanes['ok']}/{np_} guard={guard.tripped}")
+        # A point fits only if it loaded, every lane answered a full-context request
+        # at once, and the peak device memory over load + that full load fits.
+        full = ok and lanes is not None and lanes["ok"] == np_ and not guard.tripped
+        cost = row["peak_delta_mib"] if full and row["peak_delta_mib"] is not None else float("inf")
+        self.cache[key] = cost
+        time.sleep(1)
+        return cost
+
+    def tokens(self, text):
+        req = urllib.request.Request(self.url + "/tokenize", data=json.dumps({"content": text}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return len(json.load(r)["tokens"])
+
+    def fill_lanes(self, np_, ctx, guard):
+        """Send np_ concurrent decision requests, each sized to fill its slot's context."""
+        a = self.args
+        target = max(64, ctx - a.lane_margin)
+        text = state_text(target)
+        try:  # trim the state to the target by the server's own tokenizer
+            n = self.tokens(text)
+            while n > target and len(text) > 100:
+                text = text[: int(len(text) * target / n * 0.98)]
+                n = self.tokens(text)
+        except Exception:
+            n = None
+        body = {"state": text, "questions": questions(a.lane_questions)}
+        if a.mmproj:
+            body["images"] = [TEST_IMAGE]
+        results = [None] * np_
+
+        def one(i):
+            results[i] = post(self.url, body, a.lane_timeout)
+
+        t0 = time.monotonic()
+        ts = [threading.Thread(target=one, args=(i,)) for i in range(np_)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        codes = {}
+        for r in results:
+            c = r[1] if r else 0
+            codes[str(c)] = codes.get(str(c), 0) + 1
+        lats = sorted(r[0] for r in results if r and r[1] == 200)
+        return {"state_tokens": n, "questions": a.lane_questions, "image": bool(a.mmproj),
+                "ok": len(lats), "codes": codes, "wall_s": round(time.monotonic() - t0, 2),
+                "max_latency_s": round(lats[-1], 2) if lats else None}
+
+    def max_np(self, ctx, budget):
+        """Largest slot count fitting `budget` at this per-slot context (binary search)."""
+        if self.measure(1, ctx) > budget:
+            return 0
+        lo, hi = 1, self.args.np_max
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.measure(mid, ctx) <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def max_ctx(self, np_, lo, budget):
+        """Largest per-slot context (multiple of the fine step) fitting at np_."""
+        step = self.args.ctx_fine
+        hi = self.args.ctx_max
+        lo_i, hi_i = lo // step, hi // step
+        while lo_i < hi_i:
+            mid = (lo_i + hi_i + 1) // 2
+            if self.measure(np_, mid * step) <= budget:
+                lo_i = mid
+            else:
+                hi_i = mid - 1
+        return lo_i * step
+
+
+def cmd_fit(args):
+    f = Fitter(args)
+    log(f"GPU {args.gpu} used before fit: {f.base} MiB; budgets {args.budgets_mib}")
+    for budget in args.budgets_mib:
+        frontier = {}
+        ctx = args.ctx_coarse
+        while ctx <= args.ctx_max:
+            n = f.max_np(ctx, budget)
+            if n == 0:
+                break
+            frontier[n] = ctx  # the largest coarse ctx at which n is still the max
+            ctx += args.ctx_coarse
+        for n, c in sorted(frontier.items()):
+            best = f.max_ctx(n, c, budget)
+            emit(args, {"mode": "fit-result", "model": os.path.basename(args.model),
+                        "budget_mib": budget, "np": n, "max_ctx_per_slot": best})
+            log(f"budget {budget}: np={n} -> max ctx/slot {best}")
+
+
+def cmd_points(args):
+    """Measure fixed (slots x per-slot context) points, e.g. to check another quant's offset."""
+    f = Fitter(args)
+    log(f"GPU {args.gpu} used before points: {f.base} MiB")
+    for n in args.np_list:
+        for c in args.ctx_list:
+            f.measure(n, c)
+
+
 def ints(s):
     return [int(x) for x in s.split(",") if x]
 
@@ -285,8 +486,42 @@ def main():
             s.add_argument("--extra", default="", help="more llama-server args, e.g. '--kv-unified -fa on'")
             s.add_argument("--max-start-used-mib", type=int, default=1200,
                            help="refuse to start if the GPU already uses more (prod d1 still up)")
+
+    for name in ("fit", "points"):
+        s = sub.add_parser(name, help="slot/context fit search against VRAM budgets" if name == "fit"
+                           else "measure fixed slot x context points")
+
+        if name == "points":
+            s.add_argument("--np-list", type=ints, default=[1, 4, 8])
+            s.add_argument("--ctx-list", type=ints, default=[2048, 8192])
+        _fit_args(s)
     args = p.parse_args()
-    (cmd_load if args.cmd == "load" else cmd_sweep)(args)
+    {"load": cmd_load, "sweep": cmd_sweep, "fit": cmd_fit, "points": cmd_points}[args.cmd](args)
+
+
+def _fit_args(s):
+    s.add_argument("--server", required=True)
+    s.add_argument("--model", required=True)
+    s.add_argument("--mmproj")
+    s.add_argument("--device", help="e.g. Vulkan0, as the 970 tier runs")
+    s.add_argument("--budgets-mib", type=ints, default=[2048, 3584, 4096, 6144, 8192, 12288])
+    s.add_argument("--ctx-coarse", type=int, default=2048)
+    s.add_argument("--ctx-fine", type=int, default=256)
+    s.add_argument("--ctx-max", type=int, default=32768)
+    s.add_argument("--np-max", type=int, default=32)
+    s.add_argument("--batch", type=int, default=4096)
+    s.add_argument("--unified", action="store_true", help="-c is the shared total, not per slot")
+    s.add_argument("--extra", default="")
+    s.add_argument("--port", type=int, default=18080)
+    s.add_argument("--load-timeout", type=int, default=300)
+    s.add_argument("--lane-margin", type=int, default=512,
+                   help="tokens per slot left for questions, template and image")
+    s.add_argument("--lane-questions", type=int, default=12)
+    s.add_argument("--lane-timeout", type=int, default=600)
+    s.add_argument("--gpu", type=int, default=0)
+    s.add_argument("--vram-limit-mib", type=int, default=24000)
+    s.add_argument("--host-mem-floor-mib", type=int, default=6144)
+    s.add_argument("--out")
 
 
 if __name__ == "__main__":
