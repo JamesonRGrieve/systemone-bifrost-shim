@@ -308,7 +308,7 @@ class Fitter:
         total = np_ * ctx if not a.unified else ctx
         cmd = [a.server, "-m", a.model, "--host", "127.0.0.1", "--port", str(a.port),
                "-ngl", "99", "-c", str(total), "-np", str(np_),
-               "-b", str(min(total, a.batch)), "-ub", str(min(total, a.batch))]
+               "-b", str(a.batch or ctx), "-ub", str(a.batch or ctx)]  # decision prompts run in one ubatch: >= per-slot ctx
         if a.mmproj:
             cmd += ["--mmproj", a.mmproj]
         if a.device:
@@ -509,7 +509,7 @@ def _fit_args(s):
     s.add_argument("--ctx-fine", type=int, default=256)
     s.add_argument("--ctx-max", type=int, default=32768)
     s.add_argument("--np-max", type=int, default=32)
-    s.add_argument("--batch", type=int, default=4096)
+    s.add_argument("--batch", type=int, default=0, help="-b/-ub; 0 = the per-slot context (a decision prompt must fit one ubatch)")
     s.add_argument("--unified", action="store_true", help="-c is the shared total, not per slot")
     s.add_argument("--extra", default="")
     s.add_argument("--port", type=int, default=18080)
