@@ -73,6 +73,20 @@ def post(url, body, timeout):
         return time.monotonic() - t0, 0
 
 
+def post_completion(url, text, timeout):
+    data = json.dumps({"prompt": text, "n_predict": 0, "cache_prompt": False}).encode()
+    req = urllib.request.Request(url + "/completion", data=data, headers={"Content-Type": "application/json"})
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read()
+            return time.monotonic() - t0, r.status
+    except urllib.error.HTTPError as e:
+        return time.monotonic() - t0, e.code
+    except Exception:
+        return time.monotonic() - t0, 0
+
+
 def gpu_used_mib(index):
     try:
         out = subprocess.run(
@@ -82,6 +96,23 @@ def gpu_used_mib(index):
         return int(out.splitlines()[0])
     except Exception:
         return None
+
+
+def proc_rss_mib(pid):
+    """Resident memory of a process and its children (the server's whole group)."""
+    total = 0
+    try:
+        pids = [pid] + [int(x) for x in open(f"/proc/{pid}/task/{pid}/children").read().split()]
+    except OSError:
+        return None
+    for p in pids:
+        try:
+            for line in open(f"/proc/{p}/status"):
+                if line.startswith("VmRSS:"):
+                    total += int(line.split()[1]) // 1024
+        except OSError:
+            pass
+    return total
 
 
 def host_avail_mib():
@@ -95,23 +126,31 @@ def host_avail_mib():
 class Guard(threading.Thread):
     """Samples VRAM and host memory; trips (and runs on_trip) past a limit."""
 
-    def __init__(self, args, on_trip=None):
+    def __init__(self, args, on_trip=None, pid=None):
         super().__init__(daemon=True)
-        self.args, self.on_trip = args, on_trip
-        self.peak_vram, self.min_host = 0, None
+        self.args, self.on_trip, self.pid = args, on_trip, pid
+        self.peak_vram, self.min_host, self.peak_rss = 0, None, 0
         self.tripped, self.stop_ev = None, threading.Event()
 
     def run(self):
-        while not self.stop_ev.wait(0.5):
+        while not self.stop_ev.wait(0.3):
             v = gpu_used_mib(self.args.gpu)
             h = host_avail_mib()
+            r = proc_rss_mib(self.pid) if self.pid else None
             if v is not None:
                 self.peak_vram = max(self.peak_vram, v)
             if h is not None:
                 self.min_host = h if self.min_host is None else min(self.min_host, h)
+            if r is not None:
+                self.peak_rss = max(self.peak_rss, r)
             reason = None
+            rss_limit = getattr(self.args, "rss_limit_mib", None)
             if v is not None and v > self.args.vram_limit_mib:
                 reason = f"vram {v} MiB > {self.args.vram_limit_mib}"
+            elif r is not None and rss_limit and r > rss_limit:
+                # The CT's MemAvailable hides host-wide pressure (2026-11-25: a server at
+                # 15.8 GB RSS took the desktop to 1.4 GB free); cap the server itself.
+                reason = f"server rss {r} MiB > {rss_limit}"
             elif h is not None and h < self.args.host_mem_floor_mib:
                 reason = f"host MemAvailable {h} MiB < {self.args.host_mem_floor_mib}"
             if reason and not self.tripped:
@@ -355,7 +394,7 @@ class Fitter:
             except ProcessLookupError:
                 pass
 
-        guard = Guard(a, on_trip=kill)
+        guard = Guard(a, on_trip=kill, pid=proc.pid)
         guard.start()
         lanes = None
         try:
@@ -378,10 +417,10 @@ class Fitter:
                "lanes": lanes,
                "peak_vram_mib": guard.peak_vram,
                "peak_delta_mib": (guard.peak_vram - self.base) if self.base is not None else None,
-               "min_host_avail_mib": guard.min_host}
+               "min_host_avail_mib": guard.min_host, "peak_rss_mib": guard.peak_rss}
         emit(a, row)
         log(f"np={np_} ctx={ctx}: loaded={ok} idle={row['gpu_used_delta_mib']} "
-            f"peak={row['peak_delta_mib']} lanes={lanes and lanes['ok']}/{np_} guard={guard.tripped}")
+            f"peak={row['peak_delta_mib']} rss={guard.peak_rss} lanes={lanes and lanes['ok']}/{np_} guard={guard.tripped}")
         # A point fits only if it loaded, every lane answered a full-context request
         # at once, and the peak device memory over load + that full load fits.
         cost = self.cost_of(row)
@@ -398,7 +437,8 @@ class Fitter:
     def fill_lanes(self, np_, ctx, guard):
         """Send np_ concurrent decision requests, each sized to fill its slot's context."""
         a = self.args
-        target = max(64, ctx - a.lane_margin)
+        per_slot = ctx // np_ if a.unified else ctx  # unified: the lanes share one -c
+        target = max(64, per_slot - a.lane_margin)
         text = state_text(target)
         try:  # trim the state to the target by the server's own tokenizer
             n = self.tokens(text)
@@ -411,9 +451,16 @@ class Fitter:
         if a.mmproj:
             body["images"] = [TEST_IMAGE]
         results = [None] * np_
+        apis = ["systemone"] * np_
 
         def one(i):
-            results[i] = post(self.url, body, a.lane_timeout)
+            r = post(self.url, body, a.lane_timeout)
+            if r[1] == 501:
+                # Scorers without /v1/systemone (Qwen3.5 decider, Jev-Style, strands): fill the
+                # lane with a plain prefill of the same prompt, which allocates the same memory.
+                r = post_completion(self.url, text, a.lane_timeout)
+                apis[i] = "completion"
+            results[i] = r
 
         t0 = time.monotonic()
         ts = [threading.Thread(target=one, args=(i,)) for i in range(np_)]
@@ -427,6 +474,7 @@ class Fitter:
             codes[str(c)] = codes.get(str(c), 0) + 1
         lats = sorted(r[0] for r in results if r and r[1] == 200)
         return {"state_tokens": n, "questions": a.lane_questions, "image": bool(a.mmproj),
+                "api": sorted(set(apis)),
                 "ok": len(lats), "codes": codes, "wall_s": round(time.monotonic() - t0, 2),
                 "max_latency_s": round(lats[-1], 2) if lats else None}
 
@@ -553,6 +601,8 @@ def _fit_args(s):
     s.add_argument("--gpu", type=int, default=0)
     s.add_argument("--vram-limit-mib", type=int, default=24000)
     s.add_argument("--host-mem-floor-mib", type=int, default=6144)
+    s.add_argument("--rss-limit-mib", type=int, default=8192,
+                   help="kill the server (and fail the point) past this resident memory")
     s.add_argument("--out")
 
 
