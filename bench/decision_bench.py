@@ -299,6 +299,29 @@ class Fitter:
         self.base = gpu_used_mib(args.gpu)
         self.url = f"http://127.0.0.1:{args.port}"
         self.logpath = (args.out or "fit") + ".server.log"
+        self.resume()
+
+    @staticmethod
+    def cost_of(row):
+        lanes = row.get("lanes")
+        full = (row.get("loaded") and lanes is not None and lanes.get("ok") == row["np"]
+                and not row.get("guard"))
+        peak = row.get("peak_delta_mib")
+        return peak if full and peak is not None else float("inf")
+
+    def resume(self):
+        """Reuse points an earlier, interrupted run of this model already measured."""
+        if not self.args.out or not os.path.exists(self.args.out):
+            return
+        with open(self.args.out) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("mode") == "fit" and not r.get("skipped"):
+                    self.cache[(r["np"], r["ctx_per_slot"])] = self.cost_of(r)
+        log(f"resumed {len(self.cache)} measured points from {self.args.out}")
 
     def measure(self, np_, ctx):
         key = (np_, ctx)
@@ -306,8 +329,15 @@ class Fitter:
             return self.cache[key]
         a = self.args
         total = np_ * ctx if not a.unified else ctx
+        if total > a.max_ctx_total:
+            # Host safety (2026-11-25: 32 lanes x ~10K on the desktop 3090 ran with the host's
+            # load average at 55): never load more total context than this; extrapolate past it.
+            emit(a, {"mode": "fit", "model": os.path.basename(a.model), "np": np_,
+                     "ctx_per_slot": ctx, "ctx_total": total, "skipped": "max-ctx-total"})
+            self.cache[key] = float("inf")
+            return float("inf")
         cmd = [a.server, "-m", a.model, "--host", "127.0.0.1", "--port", str(a.port),
-               "-ngl", "99", "-c", str(total), "-np", str(np_),
+               "-ngl", "99", "-c", str(total), "-np", str(np_), "--cache-ram", "0",
                "-b", str(a.batch or ctx), "-ub", str(a.batch or ctx)]  # decision prompts run in one ubatch: >= per-slot ctx
         if a.mmproj:
             cmd += ["--mmproj", a.mmproj]
@@ -354,10 +384,9 @@ class Fitter:
             f"peak={row['peak_delta_mib']} lanes={lanes and lanes['ok']}/{np_} guard={guard.tripped}")
         # A point fits only if it loaded, every lane answered a full-context request
         # at once, and the peak device memory over load + that full load fits.
-        full = ok and lanes is not None and lanes["ok"] == np_ and not guard.tripped
-        cost = row["peak_delta_mib"] if full and row["peak_delta_mib"] is not None else float("inf")
+        cost = self.cost_of(row)
         self.cache[key] = cost
-        time.sleep(1)
+        time.sleep(a.pause)
         return cost
 
     def tokens(self, text):
@@ -513,6 +542,9 @@ def _fit_args(s):
     s.add_argument("--unified", action="store_true", help="-c is the shared total, not per slot")
     s.add_argument("--extra", default="")
     s.add_argument("--port", type=int, default=18080)
+    s.add_argument("--max-ctx-total", type=int, default=131072,
+                   help="never load a point with more total context (host safety); extrapolate past it")
+    s.add_argument("--pause", type=int, default=15, help="seconds between points")
     s.add_argument("--load-timeout", type=int, default=300)
     s.add_argument("--lane-margin", type=int, default=512,
                    help="tokens per slot left for questions, template and image")
